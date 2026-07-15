@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=5
+// HERDR_INTEGRATION_VERSION=6
 // @ts-nocheck
 
 import { createConnection } from "node:net";
@@ -66,7 +66,6 @@ type AgentState = "working" | "blocked" | "idle";
 type QueuedState = {
   state: AgentState;
   message?: string;
-  seq: number;
 };
 
 const idleDebounceMs = parseDurationEnv("HERDR_OMP_IDLE_DEBOUNCE_MS", 250);
@@ -193,7 +192,7 @@ let sendInFlight = false;
 let queuedState: QueuedState | undefined;
 
 function queueState(state: AgentState, message?: string): void {
-  queuedState = { state, message, seq: nextReportSeq() };
+  queuedState = { state, message };
   if (!sendInFlight) {
     void drainStateQueue();
   }
@@ -209,7 +208,7 @@ async function drainStateQueue(): Promise<void> {
     while (queuedState) {
       const next = queuedState;
       queuedState = undefined;
-      await sendState(next.state, next.message, next.seq);
+      await sendState(next.state, next.message);
     }
   } finally {
     sendInFlight = false;
@@ -252,6 +251,147 @@ function askBlockedMessage(args: any): string {
   return "waiting for user input";
 }
 
+const metadataTokenNames = [
+  "omp_context_used",
+  "omp_context_window",
+  "omp_context_percent",
+  "omp_active_subagents",
+];
+
+function decimalString(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === "string" && value.length > 0 && Number.isFinite(Number(value))) {
+    return value;
+  }
+  return undefined;
+}
+
+function contextUsageTokens(ctx: unknown): Record<string, string> | undefined {
+  try {
+    const usage = ctx?.getContextUsage?.();
+    if (!usage || typeof usage !== "object") {
+      return undefined;
+    }
+    const tokens = decimalString(usage.tokens);
+    const contextWindow = decimalString(usage.contextWindow);
+    const percent = decimalString(usage.percent);
+    if (!tokens || !contextWindow || !percent) {
+      return undefined;
+    }
+    return {
+      omp_context_used: tokens,
+      omp_context_window: contextWindow,
+      omp_context_percent: percent,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function reportMetadata(
+  title: string | undefined,
+  tokens: Record<string, string | null>,
+): Promise<void> {
+  return sendRequest({
+    id: `${source}:metadata:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+    method: "pane.report_metadata",
+    params: {
+      pane_id: paneId,
+      source,
+      agent: "omp",
+      seq: nextReportSeq(),
+      ...(title ? { title } : { clear_title: true }),
+      tokens,
+    },
+  });
+}
+
+function lifecycleSubagentId(event: unknown): string | undefined {
+  const candidate = event?.id ?? event?.taskId ?? event?.task_id ?? event?.subagentId ?? event?.subagent_id;
+  return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+}
+
+function lifecycleStatus(event: unknown): string | undefined {
+  const candidate = event?.status ?? event?.state ?? event?.phase;
+  return typeof candidate === "string" ? candidate.toLowerCase() : undefined;
+}
+
+type RootSubagentCollector = (channel: string, event: unknown) => void;
+
+type SubagentCollectorBridge = {
+  collectors: Map<string, RootSubagentCollector>;
+  owners: Map<string, string>;
+};
+
+const collectorBridgeSymbol = Symbol.for("herdr.omp.subagent-collector-bridge");
+
+function subagentCollectorBridge(): SubagentCollectorBridge {
+  const root = globalThis as typeof globalThis & {
+    [collectorBridgeSymbol]?: SubagentCollectorBridge;
+  };
+  if (!root[collectorBridgeSymbol]) {
+    root[collectorBridgeSymbol] = {
+      collectors: new Map(),
+      owners: new Map(),
+    };
+  }
+  return root[collectorBridgeSymbol];
+}
+
+function sessionRefKey(sessionRef: Record<string, unknown> | undefined): string | undefined {
+  if (!sessionRef) {
+    return undefined;
+  }
+  const path = sessionRef.agent_session_path;
+  if (typeof path === "string") {
+    return `path:${path}`;
+  }
+  const id = sessionRef.agent_session_id;
+  return typeof id === "string" ? `id:${id}` : undefined;
+}
+
+function sessionRefFromContext(ctx: unknown): Record<string, unknown> | undefined {
+  try {
+    const path = ctx?.sessionManager?.getSessionFile?.();
+    if (typeof path === "string" && path.startsWith("/")) {
+      return { agent_session_path: path };
+    }
+  } catch {
+    // Session IDs remain available in --no-session mode.
+  }
+  try {
+    const id = ctx?.sessionManager?.getSessionId?.();
+    if (typeof id === "string" && id.length > 0) {
+      return { agent_session_id: id };
+    }
+  } catch {
+    // No session identity is available yet.
+  }
+  return undefined;
+}
+
+function subagentSessionKeys(event: unknown, id: string): string[] {
+  const keys = new Set([`id:${id}`]);
+  for (const candidate of [
+    event?.sessionFile,
+    event?.session_file,
+    event?.agentSessionFile,
+    event?.agent_session_path,
+    event?.sessionId,
+    event?.session_id,
+    event?.agentSessionId,
+    event?.agent_session_id,
+  ]) {
+    if (typeof candidate === "string" && candidate.length > 0) {
+      keys.add(candidate.startsWith("/") ? `path:${candidate}` : `id:${candidate}`);
+    }
+  }
+  return [...keys];
+}
+
+
 export default function (pi) {
   if (!enabled()) {
     return;
@@ -267,7 +407,16 @@ export default function (pi) {
   let lastMessage: string | undefined;
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
-  let rootSession = false;
+  let currentContext: unknown;
+  let localSessionKey: string | undefined;
+  let registeredSessionKey: string | undefined;
+  let reportedSessionRef: string | undefined;
+  let lastMetadataSignature: string | undefined;
+  const activeSubagents = new Set<string>();
+  const terminalSubagents = new Set<string>();
+  const retiredSubagents = new Set<string>();
+  const lifecycleManagedSubagents = new Set<string>();
+  const knownSubagents = new Set<string>();
 
   function clearTimer(timer: ReturnType<typeof setTimeout> | undefined) {
     if (timer) {
@@ -311,6 +460,107 @@ export default function (pi) {
     queueState(next.state, next.message);
   }
 
+  function reportMetadataIfChanged(title: string | undefined, tokens: Record<string, string | null>) {
+    const signature = JSON.stringify([title ?? null, metadataTokenNames.map((name) => tokens[name])]);
+    if (signature === lastMetadataSignature) {
+      return;
+    }
+    lastMetadataSignature = signature;
+    void reportMetadata(title, tokens);
+  }
+
+  function reportCurrentMetadata(ctx: unknown, clear = false) {
+    if (clear) {
+      reportMetadataIfChanged(
+        undefined,
+        Object.fromEntries(metadataTokenNames.map((name) => [name, null])),
+      );
+      return;
+    }
+    const manager = ctx?.sessionManager;
+    let title: string | undefined;
+    try {
+      const candidate = manager?.getSessionName?.();
+      title = typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+    } catch {
+      title = undefined;
+    }
+    const usage = contextUsageTokens(ctx);
+    const tokens: Record<string, string | null> = {};
+    for (const name of metadataTokenNames) {
+      tokens[name] =
+        usage?.[name] ??
+        (name === "omp_active_subagents" ? String(activeSubagents.size) : null);
+    }
+    reportMetadataIfChanged(title, tokens);
+  }
+
+  function resetSessionState() {
+    clearPendingTimers();
+    clearFailureState();
+    agentActive = false;
+    blockedCount = 0;
+    blockedMessage = undefined;
+    for (const id of knownSubagents) {
+      retiredSubagents.add(id);
+    }
+    activeSubagents.clear();
+    terminalSubagents.clear();
+    lifecycleManagedSubagents.clear();
+    knownSubagents.clear();
+  }
+
+  function unregisterRootCollector() {
+    if (!registeredSessionKey) {
+      return;
+    }
+    const bridge = subagentCollectorBridge();
+    bridge.collectors.delete(registeredSessionKey);
+    for (const [childSessionKey, rootSessionKey] of bridge.owners) {
+      if (rootSessionKey === registeredSessionKey) {
+        bridge.owners.delete(childSessionKey);
+      }
+    }
+    registeredSessionKey = undefined;
+  }
+
+  function registerRootCollector() {
+    const sessionKey = sessionRefKey(currentSessionRef());
+    if (!sessionKey || registeredSessionKey === sessionKey) {
+      return;
+    }
+    unregisterRootCollector();
+    registeredSessionKey = sessionKey;
+    subagentCollectorBridge().collectors.set(sessionKey, (channel, event) => {
+      collectSubagentEvent(channel, event);
+    });
+  }
+
+  function ensureInteractiveSession(ctx: unknown, sessionStartSource = "startup"): boolean {
+    if (ctx?.hasUI !== true) {
+      return false;
+    }
+    const previousSession = currentSessionRef();
+    updateSessionRef(ctx);
+    const nextSession = currentSessionRef();
+    localSessionKey = sessionRefKey(nextSession);
+    const previousSessionKey = previousSession ? JSON.stringify(previousSession) : undefined;
+    const nextSessionKey = nextSession ? JSON.stringify(nextSession) : undefined;
+    if (previousSessionKey && nextSessionKey && previousSessionKey !== nextSessionKey) {
+      unregisterRootCollector();
+      resetSessionState();
+      reportCurrentMetadata(currentContext, true);
+    }
+    currentContext = ctx;
+    registerRootCollector();
+    if (nextSessionKey && nextSessionKey !== reportedSessionRef) {
+      reportedSessionRef = nextSessionKey;
+      void reportSession(sessionStartSource);
+    }
+    reportCurrentMetadata(ctx);
+    return true;
+  }
+
   function scheduleIdle() {
     clearPendingTimers();
     clearFailureState();
@@ -327,7 +577,6 @@ export default function (pi) {
     failureBlocked = false;
     failureMessage = message;
     publishState();
-
     retryTimer = setTimeout(() => {
       retryTimer = undefined;
       retryHoldActive = false;
@@ -335,24 +584,6 @@ export default function (pi) {
       publishState();
     }, retryGraceMs);
     retryTimer.unref?.();
-  }
-
-  function activateRootSession(ctx: any, sessionStartSource = "startup"): boolean {
-    if (ctx?.hasUI !== true) {
-      return false;
-    }
-    rootSession = true;
-    updateSessionRef(ctx);
-    void reportSession(sessionStartSource);
-    return true;
-  }
-
-  function resetSessionState() {
-    clearPendingTimers();
-    clearFailureState();
-    agentActive = false;
-    blockedCount = 0;
-    blockedMessage = undefined;
   }
 
   function activateBlocked(message: string | undefined) {
@@ -370,41 +601,167 @@ export default function (pi) {
     publishState();
   }
 
-  pi.events.on("herdr:blocked", (data) => {
-    if (!rootSession) {
+  pi.events.on("herdr:blocked", (data, ctx) => {
+    if (!ensureInteractiveSession(ctx ?? currentContext)) {
       return;
     }
     if (!data?.active) {
       deactivateBlocked();
       return;
     }
-
     activateBlocked(data.label);
   });
 
-  pi.on("session_start", (_event, ctx) => {
-    if (!activateRootSession(ctx)) {
+  // OMP lifecycle is present only in newer releases. Older event/progress
+  // channels let us derive the same activity from their payloads.
+  function updateSubagentActivity(id: string, active: boolean, terminal = false) {
+    if (terminal) {
+      terminalSubagents.add(id);
+    }
+    if (active && terminalSubagents.has(id)) {
       return;
     }
-    // A reload can replace this extension mid-run without emitting another agent_start.
+    const wasActive = activeSubagents.has(id);
+    if (active) {
+      activeSubagents.add(id);
+    } else {
+      activeSubagents.delete(id);
+    }
+    if (wasActive !== activeSubagents.has(id)) {
+      reportCurrentMetadata(currentContext);
+    }
+  }
+
+  function collectSubagentEvent(channel: string, event: unknown) {
+    const progress = event?.progress;
+    const progressId = progress?.id;
+    const id =
+      channel === "task:subagent:progress"
+        ? typeof progressId === "string" || typeof progressId === "number"
+          ? String(progressId)
+          : undefined
+        : lifecycleSubagentId(event) ??
+          (typeof event?.index === "number" || typeof event?.index === "string"
+            ? `index:${event.index}`
+            : undefined);
+    if (!id) {
+      return;
+    }
+
+    if (channel === "task:subagent:lifecycle") {
+      const status = lifecycleStatus(event);
+      if (status === "started") {
+        // A follow-up turn deliberately reuses the persistent subagent ID.
+        // Only the explicit lifecycle transition may open that new epoch.
+        retiredSubagents.delete(id);
+        terminalSubagents.delete(id);
+        lifecycleManagedSubagents.add(id);
+        knownSubagents.add(id);
+        if (registeredSessionKey) {
+          const owners = subagentCollectorBridge().owners;
+          for (const childSessionKey of subagentSessionKeys(event, id)) {
+            owners.set(childSessionKey, registeredSessionKey);
+          }
+        }
+        updateSubagentActivity(id, true);
+      } else if (status === "completed" || status === "failed" || status === "aborted") {
+        if (retiredSubagents.delete(id)) {
+          return;
+        }
+        lifecycleManagedSubagents.add(id);
+        knownSubagents.add(id);
+        updateSubagentActivity(id, false, true);
+      }
+      return;
+    }
+
+    const status =
+      channel === "task:subagent:progress" ? lifecycleStatus(progress) : undefined;
+    const terminal = status === "completed" || status === "failed" || status === "aborted";
+    if (retiredSubagents.has(id)) {
+      if (terminal) {
+        retiredSubagents.delete(id);
+      }
+      return;
+    }
+    // Once lifecycle has established an epoch, unscoped fallback events might
+    // belong to its previous turn and must not change the current activity.
+    if (lifecycleManagedSubagents.has(id)) {
+      return;
+    }
+    knownSubagents.add(id);
+
+    if (channel === "task:subagent:progress") {
+      updateSubagentActivity(id, !terminal, terminal);
+      return;
+    }
+
+    const type = event?.event?.type ?? event?.event?.name ?? event?.event?.event;
+    if (type === "agent_start") {
+      updateSubagentActivity(id, true);
+    } else if (type === "agent_end") {
+      // agent_end concludes one AgentSessionEvent turn — deactivate without
+      // marking terminal, since a future lifecycle transition may reuse the id.
+      updateSubagentActivity(id, false);
+    }
+  }
+
+  function routeSubagentEvent(channel: string, event: unknown) {
+    if (registeredSessionKey) {
+      collectSubagentEvent(channel, event);
+      return;
+    }
+    const ownerSessionKey = localSessionKey
+      ? subagentCollectorBridge().owners.get(localSessionKey)
+      : undefined;
+    if (ownerSessionKey) {
+      subagentCollectorBridge().collectors.get(ownerSessionKey)?.(channel, event);
+    }
+  }
+
+  pi.events.on("task:subagent:lifecycle", (event) => {
+    routeSubagentEvent("task:subagent:lifecycle", event);
+  });
+  pi.events.on("task:subagent:progress", (event) => {
+    routeSubagentEvent("task:subagent:progress", event);
+  });
+  pi.events.on("task:subagent:event", (event) => {
+    routeSubagentEvent("task:subagent:event", event);
+  });
+
+  pi.on("session_start", (event, ctx) => {
+    localSessionKey = sessionRefKey(sessionRefFromContext(ctx)) ?? localSessionKey;
+    if (!ensureInteractiveSession(ctx, event?.reason || "startup")) {
+      return;
+    }
     agentActive = ctx?.isIdle?.() === false;
     publishState(true);
   });
 
   pi.on("session_switch", (event, ctx) => {
-    if (!activateRootSession(ctx, event?.reason || "resume")) {
+    localSessionKey = sessionRefKey(sessionRefFromContext(ctx)) ?? localSessionKey;
+    if (!ensureInteractiveSession(ctx, event?.reason || "resume")) {
       return;
     }
     resetSessionState();
+    reportCurrentMetadata(ctx);
     publishState(true);
   });
 
   pi.on("agent_start", (_event, ctx) => {
-    if (!rootSession && !activateRootSession(ctx)) {
+    if (!ensureInteractiveSession(ctx)) {
       return;
     }
-    updateSessionRef(ctx);
-    void reportSession();
+    clearPendingTimers();
+    clearFailureState();
+    agentActive = true;
+    publishState();
+  });
+
+  pi.on("turn_start", (_event, ctx) => {
+    if (!ensureInteractiveSession(ctx)) {
+      return;
+    }
     clearPendingTimers();
     clearFailureState();
     agentActive = true;
@@ -412,68 +769,71 @@ export default function (pi) {
   });
 
   pi.on("tool_approval_requested", (event, ctx) => {
-    if (!rootSession && !activateRootSession(ctx)) {
+    if (!ensureInteractiveSession(ctx)) {
       return;
     }
-    const label = event?.reason || `${event?.toolName || "Tool"} approval`;
-    activateBlocked(label);
+    activateBlocked(event?.reason || `${event?.toolName || "Tool"} approval`);
   });
 
   pi.on("tool_approval_resolved", (_event, ctx) => {
-    if (!rootSession && !activateRootSession(ctx)) {
+    if (!ensureInteractiveSession(ctx)) {
       return;
     }
     deactivateBlocked();
   });
 
   pi.on("tool_execution_start", (event, ctx) => {
-    if (event?.toolName !== "ask") {
-      return;
+    if (event?.toolName === "ask" && ensureInteractiveSession(ctx)) {
+      activateBlocked(askBlockedMessage(event.args));
     }
-    if (!rootSession && !activateRootSession(ctx)) {
-      return;
-    }
-    activateBlocked(askBlockedMessage(event.args));
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
-    if (event?.toolName !== "ask") {
-      return;
+    if (event?.toolName === "ask" && ensureInteractiveSession(ctx)) {
+      deactivateBlocked();
     }
-    if (!rootSession && !activateRootSession(ctx)) {
-      return;
-    }
-    deactivateBlocked();
   });
 
-  pi.on("agent_end", (event) => {
-    if (!rootSession) {
+  pi.on("auto_retry_start", (_event, ctx) => {
+    if (!ensureInteractiveSession(ctx)) {
       return;
     }
-    if (!agentActive) {
-      // OMP can emit duplicate/late end events while auto-retry is already
-      // holding the pane in Working. Do not let an unqualified duplicate end
-      // cancel the retry hold and publish a false Idle.
-      return;
-    }
+    clearPendingTimers();
+    retryHoldActive = true;
+    failureBlocked = false;
+    publishState();
+  });
 
+  pi.on("auto_retry_end", (_event, ctx) => {
+    if (!ensureInteractiveSession(ctx)) {
+      return;
+    }
+    retryHoldActive = false;
+    publishState();
+  });
+
+  pi.on("agent_end", (event, ctx) => {
+    if (!ensureInteractiveSession(ctx ?? currentContext) || !agentActive) {
+      return;
+    }
     agentActive = false;
-
     const retryableMessage = retryableErrorMessage(event);
     if (retryableMessage) {
       holdForRetry(retryableMessage);
       return;
     }
-
     scheduleIdle();
   });
 
-  pi.on("session_shutdown", async (event) => {
-    if (!rootSession) {
+  pi.on("session_shutdown", async (event, ctx) => {
+    if (!ensureInteractiveSession(ctx ?? currentContext)) {
       return;
     }
     clearPendingTimers();
     if (shouldReleaseOnSessionShutdown(event)) {
+      unregisterRootCollector();
+      resetSessionState();
+      reportCurrentMetadata(currentContext, true);
       await releaseAgent();
     }
   });
