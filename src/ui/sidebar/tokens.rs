@@ -8,14 +8,10 @@ use super::AgentPanelEntry;
 // The canonical agent label is a fallback for the session title: named panes
 // show the pane title alone (`OMP_TITLE_ROW`); unnamed panes keep the label so
 // the row stays identifiable (`OMP_FALLBACK_ROW`).
-const OMP_TITLE_ROW: &[AgentSidebarToken] = &[
-    AgentSidebarToken::StateIcon,
-    AgentSidebarToken::Pane,
-];
-const OMP_FALLBACK_ROW: &[AgentSidebarToken] = &[
-    AgentSidebarToken::StateIcon,
-    AgentSidebarToken::Agent,
-];
+const OMP_TITLE_ROW: &[AgentSidebarToken] =
+    &[AgentSidebarToken::StateIcon, AgentSidebarToken::Pane];
+const OMP_FALLBACK_ROW: &[AgentSidebarToken] =
+    &[AgentSidebarToken::StateIcon, AgentSidebarToken::Agent];
 const OMP_TELEMETRY_ROW: &[AgentSidebarToken] = &[
     AgentSidebarToken::OmpContext,
     AgentSidebarToken::OmpSubagents,
