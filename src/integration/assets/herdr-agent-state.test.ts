@@ -53,15 +53,18 @@ type Handler = (event: unknown, context: unknown) => unknown;
 
 function createExtensionHarness() {
   const handlers = new Map<string, Handler>();
+  const eventHandlers = new Map<string, Handler>();
   return {
     handlers,
+    eventHandlers,
     pi: {
       on(event: string, handler: Handler) {
         handlers.set(event, handler);
       },
       events: {
-        on() {
-          return () => {};
+        on(event: string, handler: Handler) {
+          eventHandlers.set(event, handler);
+          return () => eventHandlers.delete(event);
         },
       },
     },
@@ -257,17 +260,20 @@ test("Pi waits for a replacement session report before publishing state", async 
   ]);
 });
 
-async function startDroppedFirstResponseServer(name: string) {
+async function startDroppedFirstResponseServer(
+  name: string,
+  shouldDropFirstResponse?: (request: unknown) => boolean,
+) {
   const recordingSocketPath = join(tmpdir(), `herdr-${name}-${process.pid}.sock`);
   socketPath = recordingSocketPath;
   await rm(recordingSocketPath, { force: true });
 
   let connectionCount = 0;
+  let droppedFirstResponse = false;
   const attemptedRequests: unknown[] = [];
   const deliveredRequests: unknown[] = [];
   const recordingServer = createServer((socket) => {
     connectionCount += 1;
-    const connectionNumber = connectionCount;
     let input = "";
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => {
@@ -278,7 +284,11 @@ async function startDroppedFirstResponseServer(name: string) {
       }
       const request = JSON.parse(input.slice(0, newline));
       attemptedRequests.push(request);
-      if (connectionNumber === 1) {
+      if (
+        !droppedFirstResponse &&
+        (shouldDropFirstResponse?.(request) ?? true)
+      ) {
+        droppedFirstResponse = true;
         return;
       }
       deliveredRequests.push(request);
@@ -300,7 +310,10 @@ async function startDroppedFirstResponseServer(name: string) {
 }
 
 test("Oh My Pi retries working before a queued idle state", async () => {
-  const { attemptedRequests } = await startDroppedFirstResponseServer("omp-retry");
+  const { attemptedRequests } = await startDroppedFirstResponseServer(
+    "omp-retry",
+    (request) => isRecord(request) && request.method === "pane.report_agent",
+  );
   process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
   const { handlers, pi } = createExtensionHarness();
 
@@ -319,14 +332,22 @@ test("Oh My Pi retries working before a queued idle state", async () => {
   handlers.get("agent_end")?.({ messages: [] }, context);
 
   const deadline = Date.now() + 2_500;
-  while (Date.now() < deadline && attemptedRequests.length < 3) {
+  while (
+    Date.now() < deadline &&
+    attemptedRequests.filter(
+      (request) => isRecord(request) && request.method === "pane.report_agent",
+    ).length < 3
+  ) {
     await Bun.sleep(5);
   }
 
-  expect(attemptedRequests).toHaveLength(3);
-  expect(attemptedRequests[1]).toEqual(attemptedRequests[0]);
-  expect(requestState(attemptedRequests[0])).toBe("working");
-  expect(requestState(attemptedRequests[2])).toBe("idle");
+  const stateRequests = attemptedRequests.filter(
+    (request) => isRecord(request) && request.method === "pane.report_agent",
+  );
+  expect(stateRequests).toHaveLength(3);
+  expect(stateRequests[1]).toEqual(stateRequests[0]);
+  expect(requestState(stateRequests[0])).toBe("working");
+  expect(requestState(stateRequests[2])).toBe("idle");
 });
 
 test("Pi retries working state after an unanswered socket attempt", async () => {
@@ -370,6 +391,170 @@ test("Pi retries working state after an unanswered socket attempt", async () => 
   expect(attemptedRequests[1]).toEqual(attemptedRequests[0]);
   expect(reportedWorking()).toBe(true);
 });
+
+test("Oh My Pi activates from agent_start, reports metadata, and tracks subagents", async () => {
+  const requests = await startRecordingServer("omp-telemetry");
+  const { handlers, eventHandlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  const context = {
+    hasUI: true,
+    isIdle: () => false,
+    getContextUsage: () => ({ tokens: 12.5, contextWindow: 100, percent: 12.5 }),
+    sessionManager: {
+      getSessionFile: () => "/tmp/omp-session.jsonl",
+      getSessionId: () => "omp-session",
+      getSessionName: () => "Named OMP session",
+    },
+  };
+  await handlers.get("agent_start")?.({}, context);
+  eventHandlers.get("task:subagent:lifecycle")?.(
+    { id: "child-1", status: "started", sessionFile: "/tmp/omp-child-1.jsonl", index: 0 },
+    context,
+  );
+  eventHandlers.get("task:subagent:lifecycle")?.(
+    { id: "child-1", status: "completed", sessionFile: "/tmp/omp-child-1.jsonl", index: 0 },
+    context,
+  );
+  eventHandlers.get("task:subagent:event")?.({
+    id: "child-2",
+    event: { type: "agent_start" },
+  });
+  eventHandlers.get("task:subagent:event")?.({
+    id: "child-2",
+    event: { type: "agent_end" },
+  });
+
+  const deadline = Date.now() + 1_000;
+  while (
+    Date.now() < deadline &&
+    requests.filter((request) => isRecord(request) && request.method === "pane.report_metadata").length < 5
+  ) {
+    await Bun.sleep(5);
+  }
+
+  const methods = requests
+    .filter(isRecord)
+    .map((request) => request.method);
+  expect(methods.indexOf("pane.report_agent_session")).toBeLessThan(
+    methods.indexOf("pane.report_agent"),
+  );
+  const metadata = requests
+    .filter((request) => isRecord(request) && request.method === "pane.report_metadata")
+    .map((request) => (isRecord(request) ? request.params : undefined));
+  expect(metadata).toContainEqual(
+    expect.objectContaining({
+      title: "Named OMP session",
+      tokens: expect.objectContaining({
+        omp_context_used: "12.5",
+        omp_context_window: "100",
+        omp_context_percent: "12.5",
+      }),
+    }),
+  );
+  const activeSubagentCounts = metadata.flatMap((params) => {
+    if (!isRecord(params) || !isRecord(params.tokens)) {
+      return [];
+    }
+    const count = params.tokens.omp_active_subagents;
+    return typeof count === "string" ? [count] : [];
+  });
+  expect(activeSubagentCounts[0]).toBe("0");
+  expect(activeSubagentCounts).toContain("1");
+  expect(activeSubagentCounts.at(-1)).toBe("0");
+});
+
+test("Oh My Pi fallback progress uses stable IDs and preserves terminal state", async () => {
+  const requests = await startRecordingServer("omp-progress-fallback");
+  const { handlers, eventHandlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  const context = {
+    hasUI: true,
+    isIdle: () => false,
+    sessionManager: {
+      getSessionFile: () => "/tmp/omp-progress-session.jsonl",
+      getSessionId: () => "omp-progress-session",
+    },
+  };
+  await handlers.get("agent_start")?.({}, context);
+  const progress = eventHandlers.get("task:subagent:progress");
+  progress?.({
+    sessionFile: "/tmp/omp-progress-child.jsonl",
+    index: 0,
+    progress: { id: "child-progress", status: "running" },
+  }, context);
+  progress?.({
+    sessionFile: "/tmp/omp-progress-child.jsonl",
+    index: 0,
+    progress: { id: "child-progress", status: "completed" },
+  }, context);
+  progress?.({
+    sessionFile: "/tmp/omp-progress-child.jsonl",
+    index: 1,
+    progress: { id: "child-progress", status: "running" },
+  }, context);
+
+  const deadline = Date.now() + 1_000;
+  while (
+    Date.now() < deadline &&
+    requests.filter((request) => isRecord(request) && request.method === "pane.report_metadata").length <
+      3
+  ) {
+    await Bun.sleep(5);
+  }
+  const activeSubagentCounts = requests
+    .filter((request) => isRecord(request) && request.method === "pane.report_metadata")
+    .flatMap((request) => {
+      const params = isRecord(request) ? request.params : undefined;
+      const tokens = isRecord(params) ? params.tokens : undefined;
+      const count = isRecord(tokens) ? tokens.omp_active_subagents : undefined;
+      return typeof count === "string" ? [count] : [];
+    });
+  expect(activeSubagentCounts).toEqual(["0", "1", "0"]);
+});
+
+test("Oh My Pi preserves work through blocked and auto-retry transitions", async () => {
+  const requests = await startRecordingServer("omp-blocked-retry");
+  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    isIdle: () => false,
+    sessionManager: { getSessionId: () => "omp-session" },
+  };
+
+  await handlers.get("agent_start")?.({}, context);
+  await handlers.get("tool_approval_requested")?.({ reason: "Approve" }, context);
+
+  const blockedDeadline = Date.now() + 1_000;
+  while (
+    Date.now() < blockedDeadline &&
+    !requests.some((request) => requestState(request) === "blocked")
+  ) {
+    await Bun.sleep(5);
+  }
+  await handlers.get("tool_approval_resolved")?.({}, context);
+  await handlers.get("auto_retry_start")?.({}, context);
+  await handlers.get("auto_retry_end")?.({}, context);
+
+  const deadline = Date.now() + 1_000;
+  while (
+    Date.now() < deadline &&
+    requests.filter((request) => requestState(request) === "working").length < 2
+  ) {
+    await Bun.sleep(5);
+  }
+  const states = requests.map(requestState).filter(Boolean);
+  expect(states).toContain("blocked");
+  expect(states.filter((state) => state === "working").length).toBeGreaterThanOrEqual(2);
+  expect(states).not.toContain("idle");
+});
+
 
 function requestState(request: unknown): unknown {
   if (!isRecord(request) || !isRecord(request.params)) {

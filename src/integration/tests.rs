@@ -772,7 +772,7 @@ fn outdated_integrations_detect_previous_omp_version() {
     let extension_path = ext_dir.join(OMP_EXTENSION_INSTALL_NAME);
     fs::write(
         &extension_path,
-        "// HERDR_INTEGRATION_ID=omp\n// HERDR_INTEGRATION_VERSION=4\n",
+        "// HERDR_INTEGRATION_ID=omp\n// HERDR_INTEGRATION_VERSION=5\n",
     )
     .unwrap();
     std::env::set_var("HOME", &home);
@@ -785,7 +785,7 @@ fn outdated_integrations_detect_previous_omp_version() {
         crate::api::schema::IntegrationTarget::Omp
     );
     assert_eq!(outdated[0].path, extension_path);
-    assert_eq!(outdated[0].installed_version, Some(4));
+    assert_eq!(outdated[0].installed_version, Some(5));
     assert_eq!(outdated[0].expected_version, OMP_INTEGRATION_VERSION);
 
     std::env::remove_var("HOME");
@@ -2743,98 +2743,6 @@ fn pi_extension_refreshes_session_ref_before_agent_start_state() {
 }
 
 #[test]
-fn omp_extension_releases_only_for_quit_session_shutdown() {
-    let release_policy = OMP_EXTENSION_ASSET
-        .find("function shouldReleaseOnSessionShutdown")
-        .expect("omp extension should centralize session shutdown release policy");
-    let quit_check = OMP_EXTENSION_ASSET
-        .find("reason === \"quit\"")
-        .expect("omp extension should release only for true quit shutdowns");
-    let shutdown_handler = OMP_EXTENSION_ASSET
-        .find("pi.on(\"session_shutdown\", async (event)")
-        .expect("omp extension should inspect the session_shutdown event");
-    let guarded_release = OMP_EXTENSION_ASSET[shutdown_handler..]
-        .find("if (shouldReleaseOnSessionShutdown(event))")
-        .expect("omp extension should guard releaseAgent by shutdown reason");
-
-    assert!(release_policy < shutdown_handler);
-    assert!(release_policy < quit_check);
-    assert!(quit_check < shutdown_handler);
-    assert!(guarded_release > 0);
-}
-
-#[test]
-fn omp_extension_refreshes_session_ref_before_agent_start_state() {
-    let agent_start = OMP_EXTENSION_ASSET
-        .find("pi.on(\"agent_start\", (_event, ctx)")
-        .expect("omp extension should receive agent_start context");
-    let handler = &OMP_EXTENSION_ASSET[agent_start..];
-    let update_session = handler
-        .find("updateSessionRef(ctx);")
-        .expect("omp extension should refresh the active session on agent_start");
-    let report_session = handler
-        .find("void reportSession();")
-        .expect("omp extension should report the refreshed session before state");
-    let publish_state = handler
-        .find("publishState();")
-        .expect("omp extension should publish working state after refreshing session");
-
-    assert!(update_session < report_session);
-    assert!(report_session < publish_state);
-}
-
-fn omp_handler(event: &str) -> &'static str {
-    let start = OMP_EXTENSION_ASSET
-        .find(&format!("pi.on(\"{event}\""))
-        .unwrap_or_else(|| panic!("omp extension registers {event} handler"));
-    let rest = &OMP_EXTENSION_ASSET[start..];
-    let end = rest[1..]
-        .find("\n\n  pi.")
-        .map(|offset| offset + 1)
-        .unwrap_or(rest.len());
-    &rest[..end]
-}
-
-#[test]
-fn omp_root_activation_requires_ui_context() {
-    let activator = OMP_EXTENSION_ASSET
-        .find("function activateRootSession(ctx: any, sessionStartSource = \"startup\"): boolean")
-        .expect("omp extension should centralize root session activation");
-    let helper = &OMP_EXTENSION_ASSET[activator..];
-    let non_ui_guard = helper
-        .find("ctx?.hasUI !== true")
-        .expect("omp extension checks UI context before activating");
-    let root_session = helper
-        .find("rootSession = true;")
-        .expect("omp extension activates root session after UI guard");
-    let session_report = helper
-        .find("void reportSession(sessionStartSource);")
-        .expect("omp extension reports root session");
-
-    assert!(non_ui_guard < root_session);
-    assert!(root_session < session_report);
-}
-
-#[test]
-fn omp_session_start_and_switch_use_root_activation() {
-    let session_start = OMP_EXTENSION_ASSET
-        .find("pi.on(\"session_start\", (_event, ctx)")
-        .expect("omp extension registers session_start handler");
-    let session_start_handler = &OMP_EXTENSION_ASSET[session_start..];
-    session_start_handler
-        .find("if (!activateRootSession(ctx))")
-        .expect("omp session_start handler should activate root session");
-
-    let session_switch = OMP_EXTENSION_ASSET
-        .find("pi.on(\"session_switch\", (event, ctx)")
-        .expect("omp extension registers session_switch handler");
-    let session_switch_handler = &OMP_EXTENSION_ASSET[session_switch..];
-    session_switch_handler
-        .find("if (!activateRootSession(ctx, event?.reason || \"resume\"))")
-        .expect("omp session_switch handler should activate root session with switch reason");
-}
-
-#[test]
 fn omp_session_reports_include_start_source() {
     let report_session = OMP_EXTENSION_ASSET
         .find("function reportSession(sessionStartSource = \"startup\"): Promise<void>")
@@ -2866,51 +2774,6 @@ fn omp_socket_requests_are_serialized() {
         .expect("omp extension should enqueue the raw socket send");
 
     assert!(queued_send < raw_send);
-}
-
-#[test]
-fn omp_runtime_events_can_activate_root_session_after_resume() {
-    for event in [
-        "agent_start",
-        "tool_approval_requested",
-        "tool_approval_resolved",
-        "tool_execution_start",
-        "tool_execution_end",
-    ] {
-        let handler = omp_handler(event);
-        handler
-            .find("!rootSession && !activateRootSession(ctx)")
-            .unwrap_or_else(|| panic!("omp {event} handler should recover missing root session"));
-    }
-}
-
-#[test]
-fn omp_ask_and_approval_events_report_blocked_state() {
-    let approval_handler = omp_handler("tool_approval_requested");
-    approval_handler
-        .find("activateBlocked(label);")
-        .expect("approval requests should block the pane");
-
-    let approval_resolved = omp_handler("tool_approval_resolved");
-    approval_resolved
-        .find("deactivateBlocked();")
-        .expect("approval resolution should unblock the pane");
-
-    let ask_handler = omp_handler("tool_execution_start");
-    ask_handler
-        .find("event?.toolName !== \"ask\"")
-        .expect("tool execution handler should only treat Ask as blocked");
-    ask_handler
-        .find("activateBlocked(askBlockedMessage(event.args));")
-        .expect("Ask start should block the pane");
-
-    let ask_end_handler = omp_handler("tool_execution_end");
-    ask_end_handler
-        .find("event?.toolName !== \"ask\"")
-        .expect("tool execution end should only treat Ask as blocked");
-    ask_end_handler
-        .find("deactivateBlocked();")
-        .expect("Ask end should unblock the pane");
 }
 
 #[test]
