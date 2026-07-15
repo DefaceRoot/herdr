@@ -45,6 +45,8 @@ pub enum AgentSidebarToken {
     Agent,
     TerminalTitle,
     TerminalTitleStripped,
+    OmpContext,
+    OmpSubagents,
     Custom(String),
 }
 
@@ -99,6 +101,8 @@ impl Serialize for AgentSidebarToken {
             Self::Agent => serializer.serialize_str("agent"),
             Self::TerminalTitle => serializer.serialize_str("terminal_title"),
             Self::TerminalTitleStripped => serializer.serialize_str("terminal_title_stripped"),
+            Self::OmpContext => serializer.serialize_str("omp_context"),
+            Self::OmpSubagents => serializer.serialize_str("omp_subagents"),
             Self::Custom(name) => serializer.serialize_str(&format!("${name}")),
         }
     }
@@ -126,6 +130,8 @@ impl<'de> Deserialize<'de> for AgentSidebarToken {
                 ("agent", Self::Agent),
                 ("terminal_title", Self::TerminalTitle),
                 ("terminal_title_stripped", Self::TerminalTitleStripped),
+                ("omp_context", Self::OmpContext),
+                ("omp_subagents", Self::OmpSubagents),
             ],
         )
     }
@@ -180,14 +186,16 @@ fn deserialize_rows_by_agent<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let rows_by_agent = BTreeMap::<String, AgentSidebarRows>::deserialize(deserializer)?;
-    for (id, rows) in &rows_by_agent {
-        if crate::detect::parse_canonical_agent_label(id).is_none() {
+    let overrides = BTreeMap::<String, AgentSidebarRows>::deserialize(deserializer)?;
+    let mut rows_by_agent = BTreeMap::new();
+    for (id, rows) in overrides {
+        if crate::detect::parse_canonical_agent_label(&id).is_none() {
             return Err(serde::de::Error::custom(format!(
                 "unknown canonical agent id `{id}` in sidebar rows_by_agent"
             )));
         }
-        validate_sidebar_rows(rows).map_err(serde::de::Error::custom)?;
+        validate_sidebar_rows(&rows).map_err(serde::de::Error::custom)?;
+        rows_by_agent.insert(id, rows);
     }
     Ok(rows_by_agent)
 }
@@ -407,5 +415,48 @@ row_gap = 3
                 "accepted key {key:?}"
             );
         }
+    }
+    #[test]
+    fn omp_tokens_parse_round_trip_and_explicit_override_wins() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.agents.rows_by_agent]
+omp = [["state_icon", "pane"], ["omp_subagents"]]
+"#,
+        )
+        .expect("OMP sidebar override");
+
+        assert_eq!(
+            config.ui.sidebar.agents.rows_by_agent["omp"],
+            vec![
+                vec![AgentSidebarToken::StateIcon, AgentSidebarToken::Pane],
+                vec![AgentSidebarToken::OmpSubagents],
+            ]
+        );
+
+        let encoded = toml::to_string(&config.ui.sidebar).expect("serialize sidebar");
+        let decoded: SidebarConfig = toml::from_str(&encoded).expect("round-trip sidebar");
+        assert_eq!(decoded, config.ui.sidebar);
+    }
+
+    #[test]
+    fn generic_rows_remain_the_default_when_another_agent_is_overridden() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.agents.rows_by_agent]
+claude = [["agent"]]
+"#,
+        )
+        .expect("agent-specific sidebar override");
+
+        assert!(!config.ui.sidebar.agents.rows_by_agent.contains_key("omp"));
+        assert_eq!(
+            config.ui.sidebar.agents.rows_by_agent["claude"],
+            vec![vec![AgentSidebarToken::Agent]]
+        );
+        assert_eq!(
+            config.ui.sidebar.agents.rows_for_agent(Some(Agent::Omp)),
+            &config.ui.sidebar.agents.rows
+        );
     }
 }

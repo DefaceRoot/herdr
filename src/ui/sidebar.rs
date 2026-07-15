@@ -1,3 +1,4 @@
+mod omp;
 mod tokens;
 
 use ratatui::{
@@ -901,8 +902,32 @@ fn resolved_token_spans(
     secondary_style: Style,
     custom_style: Style,
     p: &Palette,
+    spinner_tick: u32,
+    working: bool,
     max_width: usize,
 ) -> Vec<Span<'static>> {
+    if resolved.iter().any(|token| {
+        matches!(
+            token,
+            ResolvedToken::OmpContext(_) | ResolvedToken::OmpSubagents(_)
+        )
+    }) && resolved.iter().all(|token| {
+        matches!(
+            token,
+            ResolvedToken::OmpContext(_) | ResolvedToken::OmpSubagents(_)
+        )
+    }) {
+        let context = resolved.iter().find_map(|token| match token {
+            ResolvedToken::OmpContext(context) => Some(*context),
+            _ => None,
+        });
+        let subagents = resolved.iter().find_map(|token| match token {
+            ResolvedToken::OmpSubagents(count) => Some(*count),
+            _ => None,
+        });
+        return omp::render_telemetry(context, subagents, max_width, spinner_tick, working, p);
+    }
+
     let fixed_widths = resolved
         .iter()
         .map(|token| match token {
@@ -926,6 +951,8 @@ fn resolved_token_spans(
             | ResolvedToken::TerminalTitle(text)
             | ResolvedToken::Branch(text)
             | ResolvedToken::Custom(text) => display_width(text),
+            ResolvedToken::OmpContext(context) => omp::context_min_width(*context),
+            ResolvedToken::OmpSubagents(count) => display_width(&format!("agents:{count}")),
             _ => 0,
         })
         .collect::<Vec<_>>();
@@ -1036,6 +1063,26 @@ fn resolved_token_spans(
                 spans.push(Span::styled(
                     truncate_end(text, budgets[index]),
                     secondary_style,
+                ));
+            }
+            ResolvedToken::OmpContext(context) => {
+                spans.extend(omp::render_telemetry(
+                    Some(*context),
+                    None,
+                    budgets[index],
+                    spinner_tick,
+                    working,
+                    p,
+                ));
+            }
+            ResolvedToken::OmpSubagents(count) => {
+                spans.extend(omp::render_telemetry(
+                    None,
+                    Some(*count),
+                    budgets[index],
+                    spinner_tick,
+                    working,
+                    p,
                 ));
             }
             ResolvedToken::GitStatus { ahead, behind } => {
@@ -1216,6 +1263,8 @@ fn render_workspace_list(
                 branch_style,
                 branch_style,
                 p,
+                0,
+                false,
                 card.rect.width.saturating_sub(prefix_width) as usize,
             ));
             frame.render_widget(
@@ -1350,6 +1399,8 @@ fn render_agent_detail(
                 agent_style,
                 agent_style,
                 p,
+                app.spinner_tick,
+                detail.state == AgentState::Working,
                 body.width
                     .saturating_sub(if row_index == 0 { 1 } else { 3 }) as usize,
             ));
@@ -1427,6 +1478,101 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+    fn spans_text(spans: &[Span<'_>]) -> String {
+        spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    fn omp_entry(title: &str) -> AgentPanelEntry {
+        AgentPanelEntry {
+            ws_idx: 0,
+            tab_idx: 0,
+            pane_id: crate::layout::PaneId::from_raw(1),
+            primary_label: "/home/user/projects/herdr".into(),
+            primary_tab_label: None,
+            pane_label: Some(title.into()),
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_label: Some("omp".into()),
+            agent: Some(Agent::Omp),
+            state: AgentState::Working,
+            seen: true,
+            last_agent_state_change_seq: None,
+            state_labels: std::collections::HashMap::new(),
+            tokens: std::collections::HashMap::from([
+                ("omp_context_percent".into(), "42".into()),
+                ("omp_active_subagents".into(), "2".into()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn omp_rows_render_session_title_and_native_telemetry_instead_of_directory() {
+        let app = crate::app::state::AppState::test_new();
+        let entry = omp_entry("This is the name of my long OMP session");
+        let rows = resolved_agent_rows(&app, &entry);
+        assert_eq!(rows.len(), 2);
+
+        let title = spans_text(&resolved_token_spans(
+            &rows[0],
+            ("⠋", Style::default()),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            &app.palette,
+            0,
+            true,
+            18,
+        ));
+        let telemetry = spans_text(&resolved_token_spans(
+            &rows[1],
+            ("⠋", Style::default()),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            &app.palette,
+            0,
+            true,
+            24,
+        ));
+
+        assert!(title.ends_with('…'), "title row: {title:?}");
+        assert!(display_width(&title) <= 18);
+        assert!(!title.contains("/home/user"));
+        assert!(telemetry.contains("42%"));
+        assert!(telemetry.contains('ᗧ'));
+        assert!(telemetry.contains("agents:2"));
+        assert!(display_width(&telemetry) <= 24);
+    }
+
+    #[test]
+    fn omp_session_titles_use_display_cell_aware_terminal_ellipsis() {
+        let app = crate::app::state::AppState::test_new();
+        for title in [
+            "This is the name of my long session",
+            "这是一个很长的会话名称",
+            "Planning 🧭 fixes 🔧 for sidebar",
+        ] {
+            let rendered = spans_text(&resolved_token_spans(
+                &[ResolvedToken::Pane(title.into())],
+                ("", Style::default()),
+                Style::default(),
+                Style::default(),
+                Style::default(),
+                Style::default(),
+                &app.palette,
+                0,
+                false,
+                10,
+            ));
+            assert!(rendered.ends_with('…'), "rendered title: {rendered:?}");
+            assert!(
+                display_width(&rendered) <= 10,
+                "rendered title exceeded width: {rendered:?}"
+            );
+        }
     }
 
     #[test]
@@ -1554,6 +1700,8 @@ mod tests {
             Style::default(),
             Style::default(),
             &app.palette,
+            0,
+            false,
             8,
         );
         let text = spans

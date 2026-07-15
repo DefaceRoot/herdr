@@ -4,6 +4,23 @@ use crate::config::{
 
 use super::AgentPanelEntry;
 
+// Native rows for a canonical OMP pane with no `rows_by_agent.omp` override.
+// The canonical agent label is a fallback for the session title: named panes
+// show the pane title alone (`OMP_TITLE_ROW`); unnamed panes keep the label so
+// the row stays identifiable (`OMP_FALLBACK_ROW`).
+const OMP_TITLE_ROW: &[AgentSidebarToken] = &[
+    AgentSidebarToken::StateIcon,
+    AgentSidebarToken::Pane,
+];
+const OMP_FALLBACK_ROW: &[AgentSidebarToken] = &[
+    AgentSidebarToken::StateIcon,
+    AgentSidebarToken::Agent,
+];
+const OMP_TELEMETRY_ROW: &[AgentSidebarToken] = &[
+    AgentSidebarToken::OmpContext,
+    AgentSidebarToken::OmpSubagents,
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ResolvedToken {
     StateIcon,
@@ -14,6 +31,8 @@ pub(super) enum ResolvedToken {
     Agent(String),
     TerminalTitle(String),
     Branch(String),
+    OmpContext(super::omp::ContextUsage),
+    OmpSubagents(usize),
     GitStatus { ahead: usize, behind: usize },
     Custom(String),
 }
@@ -23,9 +42,36 @@ pub(super) fn agent_rows(
     entry: &AgentPanelEntry,
     state_text: &str,
 ) -> Vec<Vec<ResolvedToken>> {
-    config
-        .rows_for_agent(entry.agent)
-        .iter()
+    if entry.agent == Some(crate::detect::Agent::Omp)
+        && !config
+            .rows_by_agent
+            .contains_key(crate::detect::agent_label(crate::detect::Agent::Omp))
+    {
+        let label_row = if entry.pane_label.is_some() {
+            OMP_TITLE_ROW
+        } else {
+            OMP_FALLBACK_ROW
+        };
+        resolve_agent_rows(
+            [label_row, OMP_TELEMETRY_ROW].iter().copied(),
+            entry,
+            state_text,
+        )
+    } else {
+        resolve_agent_rows(
+            config.rows_for_agent(entry.agent).iter().map(Vec::as_slice),
+            entry,
+            state_text,
+        )
+    }
+}
+
+fn resolve_agent_rows<'a>(
+    rows: impl IntoIterator<Item = &'a [AgentSidebarToken]>,
+    entry: &AgentPanelEntry,
+    state_text: &str,
+) -> Vec<Vec<ResolvedToken>> {
+    rows.into_iter()
         .filter_map(|row| {
             let resolved = row
                 .iter()
@@ -50,6 +96,17 @@ pub(super) fn agent_rows(
                         .terminal_title_stripped
                         .clone()
                         .map(ResolvedToken::TerminalTitle),
+                    AgentSidebarToken::OmpContext
+                        if entry.agent == Some(crate::detect::Agent::Omp) =>
+                    {
+                        super::omp::context_usage(&entry.tokens).map(ResolvedToken::OmpContext)
+                    }
+                    AgentSidebarToken::OmpSubagents
+                        if entry.agent == Some(crate::detect::Agent::Omp) =>
+                    {
+                        super::omp::active_subagents(&entry.tokens).map(ResolvedToken::OmpSubagents)
+                    }
+                    AgentSidebarToken::OmpContext | AgentSidebarToken::OmpSubagents => None,
                     AgentSidebarToken::Custom(name) => {
                         entry.tokens.get(name).cloned().map(ResolvedToken::Custom)
                     }
@@ -111,6 +168,10 @@ pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'
         || matches!(current, ResolvedToken::GitStatus { .. })
     {
         " "
+    } else if matches!(previous, ResolvedToken::OmpContext(_))
+        && matches!(current, ResolvedToken::OmpSubagents(_))
+    {
+        "  "
     } else {
         " · "
     }
@@ -210,6 +271,126 @@ mod tests {
                 ResolvedToken::TerminalTitle("raw title".into()),
                 ResolvedToken::Custom("custom title".into()),
             ]]
+        );
+    }
+
+    #[test]
+    fn omp_native_tokens_resolve_only_for_canonical_omp() {
+        let mut omp = entry();
+        omp.agent = Some(crate::detect::Agent::Omp);
+        omp.agent_label = Some("omp".into());
+        omp.pane_label = Some("Refactor the sidebar".into());
+        omp.tokens.extend([
+            ("omp_context_percent".into(), "12.5".into()),
+            ("omp_active_subagents".into(), "2".into()),
+        ]);
+        let config = toml::from_str::<crate::config::Config>(
+            r#"
+[ui.sidebar.agents.rows_by_agent]
+claude = [["agent"]]
+"#,
+        )
+        .expect("Claude sidebar override")
+        .ui
+        .sidebar
+        .agents;
+
+        let rows = agent_rows(&config, &omp, "working");
+        assert_eq!(
+            rows[0],
+            vec![
+                ResolvedToken::StateIcon,
+                ResolvedToken::Pane("Refactor the sidebar".into()),
+            ]
+        );
+        assert_eq!(
+            rows[1],
+            vec![
+                ResolvedToken::OmpContext(
+                    crate::ui::sidebar::omp::context_usage(&omp.tokens).unwrap()
+                ),
+                ResolvedToken::OmpSubagents(2),
+            ]
+        );
+
+        omp.agent = Some(crate::detect::Agent::Pi);
+        assert_eq!(
+            agent_rows(&config, &omp, "working"),
+            vec![
+                vec![
+                    ResolvedToken::StateIcon,
+                    ResolvedToken::Workspace("repo".into())
+                ],
+                vec![ResolvedToken::Agent("omp".into())],
+            ]
+        );
+
+        let mut non_omp_config = AgentsSidebarConfig::default();
+        non_omp_config.rows_by_agent.insert(
+            "claude".into(),
+            vec![vec![
+                AgentSidebarToken::OmpContext,
+                AgentSidebarToken::OmpSubagents,
+            ]],
+        );
+        omp.agent = Some(crate::detect::Agent::Claude);
+        assert_eq!(
+            agent_rows(&non_omp_config, &omp, "working"),
+            Vec::<Vec<ResolvedToken>>::new()
+        );
+    }
+
+    #[test]
+    fn explicit_omp_override_replaces_the_native_layout() {
+        let config = toml::from_str::<crate::config::Config>(
+            r#"
+[ui.sidebar.agents.rows_by_agent]
+omp = [["agent"]]
+"#,
+        )
+        .expect("OMP sidebar override")
+        .ui
+        .sidebar
+        .agents;
+        let mut omp = entry();
+        omp.agent = Some(crate::detect::Agent::Omp);
+        omp.agent_label = Some("omp".into());
+        omp.tokens.extend([
+            ("omp_context_percent".into(), "12.5".into()),
+            ("omp_active_subagents".into(), "2".into()),
+        ]);
+
+        assert_eq!(
+            agent_rows(&config, &omp, "working"),
+            vec![vec![ResolvedToken::Agent("omp".into())]]
+        );
+    }
+
+    #[test]
+    fn omp_missing_or_malformed_telemetry_elides_the_second_row_but_zero_is_visible() {
+        let mut omp = entry();
+        omp.agent = Some(crate::detect::Agent::Omp);
+        omp.pane_label = Some("Session title".into());
+        omp.tokens
+            .insert("omp_context_percent".into(), "malformed".into());
+
+        assert_eq!(
+            agent_rows(&AgentsSidebarConfig::default(), &omp, "working"),
+            vec![vec![
+                ResolvedToken::StateIcon,
+                ResolvedToken::Pane("Session title".into()),
+            ]]
+        );
+
+        omp.tokens.insert("omp_active_subagents".into(), "0".into());
+        assert_eq!(
+            agent_rows(&AgentsSidebarConfig::default(), &omp, "working")[1],
+            vec![ResolvedToken::OmpSubagents(0)]
+        );
+        omp.tokens.insert("omp_active_subagents".into(), "3".into());
+        assert_eq!(
+            agent_rows(&AgentsSidebarConfig::default(), &omp, "working")[1],
+            vec![ResolvedToken::OmpSubagents(3)]
         );
     }
 
